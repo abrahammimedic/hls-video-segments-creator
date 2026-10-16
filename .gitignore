@@ -1,0 +1,33 @@
+# macOS / editors
+.DS_Store
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Local tooling state
+.remember/
+.claude/
+
+# Secrets: never commit credentials
+.env
+.env.*
+*.env
+
+# Generated output (large; always reproducible from the source video)
+hls_output/
+bitrate_trial/
+bitrate_trial_*/
+*.partial/
+.work/
+
+# Source/test media
+*.mov
+*.mp4
+*.m4s
+*.m3u8
+!tests/**/*.m3u8

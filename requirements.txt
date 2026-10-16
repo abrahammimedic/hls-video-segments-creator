@@ -1,0 +1,3 @@
+# Only needed for uploading to Cloudflare R2 (r2_upload.py / make_hls.py --upload).
+# Encoding, validation and the bitrate trial use only the Python standard library + ffmpeg.
+boto3>=1.34
