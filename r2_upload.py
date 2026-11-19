@@ -28,7 +28,11 @@ from datetime import datetime, timezone
 import hls_common as common
 from hls_common import human_size
 
-REQUIRED_ENV = ["R2_ACCOUNT_ID", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "R2_BUCKET"]
+ACCOUNT_ENV = ["R2_ACCOUNT_ID", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY"]
+# Which bucket (and public address) a kind of video goes to. Short = Moments reels, in their own
+# public bucket; long = exercise videos, in the token-protected one.
+BUCKET_ENV = {"long": ("R2_BUCKET", "R2_PUBLIC_BASE_URL"),
+              "short": ("R2_MOMENTS_BUCKET", "R2_MOMENTS_PUBLIC_BASE_URL")}
 WORKERS = 16
 IMMUTABLE_CACHE = "public, max-age=31536000, immutable"   # every path is unique per version
 
@@ -37,8 +41,9 @@ ALLOWED_PATTERNS = [
     ("init", re.compile(r"^[0-9]+p/init\.mp4$")),
     ("playlist", re.compile(r"^[0-9]+p/index\.m3u8$")),
     ("master", re.compile(r"^master\.m3u8$")),
+    ("poster", re.compile(r"^poster\.jpg$")),      # the thumbnail, made by poster.py
 ]
-UPLOAD_ORDER = {"segment": 0, "init": 0, "playlist": 1, "master": 2}
+UPLOAD_ORDER = {"segment": 0, "init": 0, "poster": 0, "playlist": 1, "master": 2}
 
 
 # --------------------------------------------------------------- pure logic
@@ -58,6 +63,8 @@ def content_type(rel_path):
         return "video/iso.segment"
     if rel_path.endswith(".mp4"):
         return "video/mp4"
+    if rel_path.endswith(".jpg"):
+        return "image/jpeg"
     raise ValueError(f"no content type for {rel_path}")
 
 
@@ -101,16 +108,19 @@ def key_for(base_path, version, rel):
 
 # ----------------------------------------------------------------- R2 client
 
-def load_settings(env=None):
+def load_settings(env=None, kind="long"):
     env = os.environ if env is None else env
-    missing = [name for name in REQUIRED_ENV if not env.get(name)]
+    if kind not in BUCKET_ENV:
+        raise ValueError(f"unknown video kind {kind!r}; use 'short' or 'long'")
+    bucket_var, public_var = BUCKET_ENV[kind]
+    missing = [name for name in ACCOUNT_ENV + [bucket_var] if not env.get(name)]
     if missing:
         raise RuntimeError("missing environment variable(s): " + ", ".join(missing)
                            + ". Set them in your shell (see README, 'Cloudflare R2 setup').")
     return {
         "account_id": env["R2_ACCOUNT_ID"], "access_key": env["R2_ACCESS_KEY_ID"],
-        "secret_key": env["R2_SECRET_ACCESS_KEY"], "bucket": env["R2_BUCKET"],
-        "public_base": (env.get("R2_PUBLIC_BASE_URL") or "").rstrip("/"),
+        "secret_key": env["R2_SECRET_ACCESS_KEY"], "bucket": env[bucket_var],
+        "public_base": (env.get(public_var) or "").rstrip("/"), "kind": kind,
     }
 
 
@@ -183,6 +193,51 @@ def upload_group(client, settings, base_path, version, items, label):
     print(f"    {label}: {len(items)} files, {human_size(total_bytes)} in {time.time() - started:.0f}s      ")
 
 
+def upload_poster(client, settings, poster_path, base_path, version, dry_run=False, force=False,
+                  skip_remote_check=False):
+    """Add a poster to a version that is already published (the videos made before posters existed).
+
+    Additive: it never touches the video files. Refuses to replace an existing poster unless `force`, and refuses
+    a version that is not published (no master.m3u8 in the bucket).
+    """
+    bucket = settings["bucket"]
+    base_path = normalize_base_path(base_path)
+    master_key = key_for(base_path, version, "master.m3u8")
+    poster_key = key_for(base_path, version, "poster.jpg")
+    existing = list_objects(client, bucket, key_for(base_path, version, "")) if client is not None else {}
+    if client is not None and master_key not in existing:
+        raise RuntimeError(f"s3://{bucket}/{master_key} does not exist: publish the video first "
+                           "(a poster is added to an already published version)")
+    if poster_key in existing and not force:
+        raise RuntimeError(f"s3://{bucket}/{poster_key} already exists. Pass --force to replace it "
+                           "(browsers and Cloudflare may keep the old image for a long time: it is cached as immutable)")
+    size = os.path.getsize(poster_path)
+    print(f"\n   R2 poster: s3://{bucket}/{poster_key} ({human_size(size)})")
+    if dry_run:
+        print("     dry run: nothing was uploaded")
+        return None
+    client.upload_file(poster_path, bucket, poster_key, ExtraArgs={
+        "ContentType": "image/jpeg", "CacheControl": IMMUTABLE_CACHE})
+    remote = list_objects(client, bucket, poster_key).get(poster_key)
+    if remote != size:
+        raise RuntimeError(f"post-upload verification failed for {poster_key}: R2 has {remote} bytes, local {size}")
+    print("     verified: the object in R2 matches the local size")
+    url = f"{settings['public_base']}/{poster_key}" if settings["public_base"] else None
+    if url and not skip_remote_check:
+        import urllib.error
+        import urllib.request
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, method="HEAD",
+                                                               headers={"User-Agent": "poster-check/1"}), timeout=30) as r:
+                kind = r.headers.get("Content-Type", "")
+                print(f"     public check: HTTP {r.status}, {kind}" + ("" if kind.startswith("image/") else "  <-- NOT an image"))
+        except (urllib.error.URLError, OSError) as err:
+            print(f"     public check failed ({err})")
+    elif url:
+        print("     public check skipped (token-protected domain)")
+    return url
+
+
 def cdn_check(master_url, segment_url):
     """Advisory only: report what Cloudflare says about cacheability. Never raises, never fails a release."""
     import urllib.error
@@ -228,7 +283,7 @@ def cdn_check(master_url, segment_url):
 
 
 def upload_version(client, settings, version_dir, base_path, version, dry_run=False, resume=False,
-                   skip_validate=False):
+                   skip_validate=False, skip_remote_check=False, kind=None):
     version_dir = os.path.abspath(version_dir)
     bucket = settings["bucket"]
     base_path = normalize_base_path(base_path)
@@ -286,7 +341,12 @@ def upload_version(client, settings, version_dir, base_path, version, dry_run=Fa
 
     master_url = f"{settings['public_base']}/{prefix}master.m3u8" if settings["public_base"] else None
     ok = True
-    if master_url:
+    checked = False
+    if skip_remote_check:
+        print("     public checks skipped (--skip-remote-check): the bucket was verified through the S3 API "
+              "(object count and sizes) only")
+    elif master_url:
+        checked = True
         import validate_hls
         report = validate_hls.validate_remote(master_url, local_dir=version_dir)
         report.print()
@@ -301,7 +361,8 @@ def upload_version(client, settings, version_dir, base_path, version, dry_run=Fa
                                 "publish.json")
     try:
         receipt = json.load(open(work_receipt, encoding="utf-8")) if os.path.isfile(work_receipt) else {}
-        receipt.update({"master_url": master_url, "bucket_prefix": prefix, "remote_validated": bool(master_url) and ok,
+        receipt.update({"master_url": master_url, "bucket_prefix": prefix, "kind": kind or settings.get("kind"),
+                        "remote_validated": checked and ok,
                         "uploaded": datetime.now(timezone.utc).isoformat()})
         os.makedirs(os.path.dirname(work_receipt), exist_ok=True)
         with open(work_receipt, "w", encoding="utf-8") as handle:
@@ -309,13 +370,16 @@ def upload_version(client, settings, version_dir, base_path, version, dry_run=Fa
     except (OSError, ValueError):
         pass
 
-    print("\n   " + ("Published and validated." if (master_url and ok) else
-                     "Uploaded, but remote validation did not pass." if master_url else "Uploaded."))
+    print("\n   " + ("Published and validated." if (checked and ok) else
+                     "Uploaded, but remote validation did not pass." if (checked and not ok) else
+                     "Uploaded (public checks skipped)." if skip_remote_check else "Uploaded."))
     if master_url:
         print(f"   Master URL: {master_url}")
-    if master_url and ok:
+    if checked and ok:
         print("   Next: point your database at this URL. Keep the previous version for a grace period before deleting it.")
-    elif master_url:
+    elif skip_remote_check:
+        print("   Not verified through the public domain. Test playback with a valid token before switching your app.")
+    elif checked:
         print("   Do NOT switch your database to this URL. Fix the cause and publish a new version.")
         raise RuntimeError("remote validation failed")
     return master_url
@@ -330,6 +394,12 @@ def parse_args():
     parser.add_argument("--dry-run", action="store_true", help="Show what would be uploaded; touch nothing")
     parser.add_argument("--resume", action="store_true", help="Finish a partially uploaded version")
     parser.add_argument("--skip-validate", action="store_true", help="Skip the local validation before uploading")
+    parser.add_argument("--kind", choices=common.KINDS, default="long",
+                        help="short = Moments reel (public Moments bucket), long = exercise video "
+                             "(token-protected bucket, public check skipped). Default: long")
+    parser.add_argument("--skip-remote-check", action="store_true",
+                        help="Skip the post-upload fetch through the public domain and the CDN check "
+                             "(use when the domain requires a token and returns 403 to plain requests)")
     return parser.parse_args()
 
 
@@ -341,10 +411,11 @@ def main():
         sys.exit("Error: version_dir must be an existing folder named v<N>, e.g. out/my-video/v1")
     version = int(match.group(1))
     try:
-        settings = load_settings()
+        settings = load_settings(kind=args.kind)
         client = make_client(settings)
         upload_version(client, settings, version_dir, args.path, version, dry_run=args.dry_run,
-                       resume=args.resume, skip_validate=args.skip_validate)
+                       resume=args.resume, skip_validate=args.skip_validate,
+                       skip_remote_check=args.skip_remote_check or args.kind == "long", kind=args.kind)
     except (RuntimeError, ValueError) as err:
         sys.exit(f"Error: {err}")
 

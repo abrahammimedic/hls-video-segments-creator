@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Encode videos into adaptive HLS (fMP4/CMAF, 6 s segments) and optionally upload to Cloudflare R2.
+"""Encode videos into adaptive HLS (fMP4/CMAF, 2 s segments by default) and optionally upload to Cloudflare R2.
 
 Per video this produces immutable, versioned output:
 
@@ -9,10 +9,11 @@ Per video this produces immutable, versioned output:
 Work files (partial encodes, fingerprints, receipts) live in <out>/<slug>/.work/ and are never uploaded.
 Renditions never exceed the source resolution, the source's aspect ratio and orientation are kept
 (portrait stays portrait), and every rendition shares one frame rate and a fixed 2 s GOP so that
-6 s segment boundaries line up across renditions.
+segment boundaries line up across renditions (segment length: --segment-seconds, default 2).
 """
 
 import argparse
+import copy
 import json
 import os
 import re
@@ -26,7 +27,8 @@ from datetime import datetime, timezone
 from fractions import Fraction
 
 import hls_common as common
-from hls_common import GOP_SECONDS, SEGMENT_SECONDS, human_size
+import poster as posters
+from hls_common import GOP_SECONDS, KIND_SEGMENT_SECONDS, KINDS, SEGMENT_SECONDS, human_size
 
 TOOL_VERSION = "1"
 
@@ -235,7 +237,7 @@ def pass1_command(input_path, r, fps, preset, passlog):
             + ["-an", "-f", "null", os.devnull])
 
 
-def pass2_command(input_path, r, fps, preset, passlog, out_dir, has_audio):
+def pass2_command(input_path, r, fps, preset, passlog, out_dir, has_audio, segment_seconds=SEGMENT_SECONDS):
     cmd = (ffmpeg_prefix(input_path)
            + ["-map", "0:v:0"] + (["-map", "0:a:0?"] if has_audio else [])
            + ["-map_metadata", "-1", "-map_chapters", "-1", "-vf", video_filter(r, fps)]
@@ -243,7 +245,7 @@ def pass2_command(input_path, r, fps, preset, passlog, out_dir, has_audio):
     if has_audio:
         cmd += AUDIO_ARGS
     cmd += [
-        "-f", "hls", "-hls_time", str(SEGMENT_SECONDS), "-hls_playlist_type", "vod",
+        "-f", "hls", "-hls_time", str(segment_seconds), "-hls_playlist_type", "vod",
         "-hls_segment_type", "fmp4", "-hls_fmp4_init_filename", "init.mp4",
         "-hls_flags", "independent_segments",
         "-hls_segment_filename", os.path.join(out_dir, "seg_%05d.m4s"),
@@ -259,14 +261,14 @@ def ffmpeg_version():
     return (result.stdout.splitlines() or ["unknown"])[0]
 
 
-def fingerprint(input_path, r, fps, preset, has_audio):
+def fingerprint(input_path, r, fps, preset, has_audio, segment_seconds=SEGMENT_SECONDS):
     stat = os.stat(input_path)
     return {
         "tool_version": TOOL_VERSION,
         "input": os.path.abspath(input_path), "input_size": stat.st_size, "input_mtime_ns": stat.st_mtime_ns,
         "width": r.width, "height": r.height, "kbps": r.kbps,
         "fps": f"{fps.numerator}/{fps.denominator}", "gop": gop_frames(fps),
-        "preset": preset, "segment_seconds": SEGMENT_SECONDS, "audio": has_audio,
+        "preset": preset, "segment_seconds": segment_seconds, "audio": has_audio,
         "audio_args": AUDIO_ARGS if has_audio else None,
         "maxrate_x": MAXRATE_MULTIPLIER, "bufsize_x": BUFSIZE_MULTIPLIER,
         "ffmpeg": ffmpeg_version(),
@@ -299,11 +301,12 @@ def read_json(path):
         return None
 
 
-def encode_rendition(input_path, info, r, fps, preset, version_dir, work_dir, force):
+def encode_rendition(input_path, info, r, fps, preset, version_dir, work_dir, force,
+                     segment_seconds=SEGMENT_SECONDS):
     """Encode one rendition into version_dir/<name>. Returns 'skipped' or 'encoded'."""
     final_dir = os.path.join(version_dir, r.name)
     print_path = os.path.join(work_dir, f"{r.name}.encode.json")
-    expected = fingerprint(input_path, r, fps, preset, info.has_audio)
+    expected = fingerprint(input_path, r, fps, preset, info.has_audio, segment_seconds)
 
     if not force and read_json(print_path) == expected and rendition_is_complete(final_dir, info.duration):
         print(f"  {r.name}: already complete with identical settings, skipping")
@@ -322,7 +325,7 @@ def encode_rendition(input_path, info, r, fps, preset, version_dir, work_dir, fo
         print(f"  {r.name}: pass 1 done in {time.time() - started:.0f}s, pass 2/2 (encoding)")
         mid = time.time()
         if subprocess.run(pass2_command(input_path, r, fps, preset, passlog, partial,
-                                        info.has_audio)).returncode != 0:
+                                        info.has_audio, segment_seconds)).returncode != 0:
             raise RuntimeError(f"{r.name}: ffmpeg pass 2 failed")
         print(f"  {r.name}: pass 2 done in {time.time() - mid:.0f}s")
 
@@ -398,6 +401,7 @@ def build_hls(input_path, args, remote_ctx=None):
     out_dir = args.out_dir or os.path.join(os.path.dirname(os.path.abspath(input_path)), "hls_output")
     slug_dir = os.path.join(out_dir, slug)
 
+    segment_seconds = common.segment_seconds_for(getattr(args, "kind", None), getattr(args, "segment_seconds", None))
     remote = remote_ctx["versions"](args.remote_path) if remote_ctx else []
     version = choose_version(slug_dir, args.version, remote)
     version_dir = os.path.join(slug_dir, f"v{version}")
@@ -415,12 +419,13 @@ def build_hls(input_path, args, remote_ctx=None):
     print(f"\n== {os.path.basename(input_path)}: {info.width}x{info.height} @ {float(info.fps):.3f} fps, "
           f"{info.duration:.0f}s, {'with' if info.has_audio else 'no'} audio")
     print(f"   -> {slug} v{version}: " + ", ".join(f"{r.name} ({r.width}x{r.height})" for r in renditions)
-          + f" at {common.format_frame_rate(fps)} fps, {SEGMENT_SECONDS}s segments")
+          + f" at {common.format_frame_rate(fps)} fps, {segment_seconds}s segments")
     if not info.has_audio:
         print("   (source has no audio track; renditions will be video-only)")
 
     for r in renditions:
-        encode_rendition(input_path, info, r, fps, args.preset, version_dir, work_dir, args.force)
+        encode_rendition(input_path, info, r, fps, args.preset, version_dir, work_dir, args.force,
+                         segment_seconds)
 
     variants = build_master(version_dir, renditions, fps, info.has_audio)
 
@@ -432,6 +437,17 @@ def build_hls(input_path, args, remote_ctx=None):
         os.remove(os.path.join(version_dir, "master.m3u8"))
         raise RuntimeError("validation failed; master.m3u8 removed so this version is not treated as built. "
                            "Fix the cause and re-run (completed renditions are reused)")
+
+    poster_path = os.path.join(version_dir, posters.POSTER_NAME)
+    if getattr(args, "no_poster", False):
+        print("   poster: skipped (--no-poster)")
+    elif os.path.isfile(poster_path) and not args.force:
+        print(f"   poster: already there ({human_size(os.path.getsize(poster_path))}), keeping it")
+    else:
+        made = posters.make_poster(input_path, info.width, info.height, info.duration, poster_path,
+                                   at=getattr(args, "poster_at", None))
+        print(f"   poster: {made['size'][0]}x{made['size'][1]} JPEG, {human_size(made['bytes'])}, frame at "
+              f"{made['time']:g}s" + (f", brightness {made['luma']}" if made["luma"] is not None else ""))
 
     file_count, total_bytes = version_file_stats(version_dir)
     receipt = {"slug": slug, "version": version, "source": os.path.abspath(input_path),
@@ -445,20 +461,52 @@ def build_hls(input_path, args, remote_ctx=None):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Encode videos to adaptive HLS (fMP4, 6 s segments) and optionally upload to R2.")
+        description="Encode videos to adaptive HLS (fMP4, 2 s segments by default) and optionally upload to R2.")
     parser.add_argument("inputs", nargs="+", help="One or more input video files")
     parser.add_argument("-d", "--out-dir", help="Output root (default: <input folder>/hls_output)")
     parser.add_argument("--name", help="Slug used in paths/URLs (default: derived from the file name)")
     parser.add_argument("--version", type=int, help="Version number (default: next unused, or resume an unfinished one)")
     parser.add_argument("--only", help="Comma-separated renditions to build, e.g. 360p,720p")
     parser.add_argument("--preset", default="slow", help="x264 preset (default: slow)")
+    parser.add_argument("--kind", choices=KINDS,
+                        help="short = Moments reel (2 s segments, public Moments bucket); long = exercise video "
+                             "(6 s segments, token-protected bucket). If omitted you are asked for each video")
+    parser.add_argument("--segment-seconds", type=int, default=None,
+                        help=f"Override the segment length, a multiple of {GOP_SECONDS} "
+                             f"(default: {KIND_SEGMENT_SECONDS['short']} for short, {KIND_SEGMENT_SECONDS['long']} for long)")
+    parser.add_argument("--poster-at", type=float, default=None, metavar="SECONDS",
+                        help="Take the poster (thumbnail) from this time. Without it the tool picks a good frame "
+                             "itself: the most representative one near the start, a quarter and halfway in, "
+                             "skipping black or white frames")
+    parser.add_argument("--no-poster", action="store_true", help="Do not make a poster (thumbnail)")
+    parser.add_argument("--poster-only", action="store_true",
+                        help="Do not encode: make the poster and add it to an ALREADY PUBLISHED version "
+                             "(needs --upload, --remote-path and --version; for videos published before posters existed)")
     parser.add_argument("--force", action="store_true", help="Re-encode even if renditions look complete")
     parser.add_argument("--upload", action="store_true", help="Upload to R2 after a successful validation")
     parser.add_argument("--remote-path", help="With --upload: bucket folder to publish into, e.g. "
                         "exercises/trimester_2/trimester_2_yoga (the version folder vN is added automatically)")
     parser.add_argument("--dry-run", action="store_true",
                         help="With --upload: show what would be uploaded without touching R2")
+    parser.add_argument("--skip-remote-check", action="store_true",
+                        help="With --upload: skip the post-upload fetch through the public domain "
+                             "(for domains that require a token)")
     args = parser.parse_args()
+    if args.segment_seconds is not None:
+        try:
+            common.check_segment_seconds(args.segment_seconds)
+        except ValueError as err:
+            parser.error(str(err))
+    if args.poster_at is not None and args.poster_at < 0:
+        parser.error("--poster-at must be 0 or more")
+    if args.poster_only:
+        if args.no_poster:
+            parser.error("--poster-only and --no-poster contradict each other")
+        if len(args.inputs) != 1:
+            parser.error("--poster-only works on one video at a time")
+        if not (args.upload and args.remote_path and args.version):
+            parser.error("--poster-only needs --upload, --remote-path and --version (the published version "
+                         "to add the poster to)")
     if len(args.inputs) > 1 and (args.name or args.version or args.remote_path):
         parser.error("--name, --version and --remote-path only make sense with a single input")
     if args.upload:
@@ -472,20 +520,72 @@ def parse_args():
     return args
 
 
+def add_poster_to_published(input_path, args, client, settings, kind):
+    """--poster-only: make the poster from the source and add it to an already published version. No encoding."""
+    info = probe_source(input_path)
+    slug = args.name or slugify(os.path.splitext(os.path.basename(input_path))[0])
+    out_dir = args.out_dir or os.path.join(os.path.dirname(os.path.abspath(input_path)), "hls_output")
+    poster_path = os.path.join(out_dir, slug, f"v{args.version}", posters.POSTER_NAME)
+    print(f"\n== {os.path.basename(input_path)}: poster only for v{args.version} ({kind})")
+    made = posters.make_poster(input_path, info.width, info.height, info.duration, poster_path, at=args.poster_at)
+    print(f"   poster: {made['size'][0]}x{made['size'][1]} JPEG, {human_size(made['bytes'])}, frame at "
+          f"{made['time']:g}s" + (f", brightness {made['luma']}" if made["luma"] is not None else ""))
+    import r2_upload
+    r2_upload.upload_poster(client, settings, poster_path, args.remote_path, args.version, dry_run=args.dry_run,
+                            force=args.force, skip_remote_check=args.skip_remote_check or kind == "long")
+
+
+def ask_kind(input_path, ask=None, interactive=None):
+    """Which kind of video is this? Asked per video unless --kind was given.
+
+    Refuses to guess when nobody can answer (no terminal): a wrong guess would put an exercise video in the
+    public bucket or cut a reel into 6 s pieces.
+    """
+    ask = ask or input
+    interactive = sys.stdin.isatty() if interactive is None else interactive
+    if not interactive:
+        raise RuntimeError("cannot ask whether this is a short or a long video without a terminal; "
+                           "pass --kind short or --kind long")
+    name = os.path.basename(input_path)
+    while True:
+        answer = ask(f'\nIs "{name}" a SHORT video (Moments reel: 2 s segments, public bucket)\n'
+                     f"or a LONG video (exercise: 6 s segments, token-protected bucket)? [s/l]: ").strip().lower()
+        if answer in ("s", "short"):
+            return "short"
+        if answer in ("l", "long"):
+            return "long"
+        print("Please answer s (short) or l (long).")
+
+
 def main():
     args = parse_args()
     for tool in ("ffmpeg", "ffprobe"):
         if not shutil.which(tool):
             sys.exit(f"Error: {tool} not found. Install it with: brew install ffmpeg")
 
-    remote_ctx = None
-    client = settings = None
+    # Ask which kind each video is up front, so the questions are not buried in hours of encoding.
+    kinds = {}
+    for input_path in args.inputs:
+        if os.path.isfile(input_path):
+            try:
+                kinds[input_path] = args.kind or ask_kind(input_path)
+            except RuntimeError as err:
+                sys.exit(f"Error: {err}")
+
+    if not kinds:
+        sys.exit("Error: none of the input files exist: " + ", ".join(args.inputs))
+
+    client = None
+    settings_by_kind = {}
     if args.upload:
         # Fail fast on missing credentials/boto3, before hours of encoding.
         import r2_upload
-        settings = r2_upload.load_settings()
-        client = r2_upload.make_client(settings)
-        remote_ctx = {"versions": lambda base: r2_upload.remote_versions(client, settings["bucket"], base)}
+        try:
+            for kind in sorted(set(kinds.values())):
+                settings_by_kind[kind] = r2_upload.load_settings(kind=kind)
+        except (RuntimeError, ValueError) as err:
+            sys.exit(f"Error: {err}")
+        client = r2_upload.make_client(next(iter(settings_by_kind.values())))   # one account, any bucket
 
     failures = []
     for input_path in args.inputs:
@@ -493,11 +593,31 @@ def main():
             print(f"Skipping, file not found: {input_path}")
             failures.append(input_path)
             continue
+        kind = kinds[input_path]
+        video_args = copy.copy(args)
+        video_args.kind = kind
+        video_args.segment_seconds = common.segment_seconds_for(kind, args.segment_seconds)
+        remote_ctx = None
+        if args.upload:
+            bucket = settings_by_kind[kind]["bucket"]
+            remote_ctx = {"versions": lambda base, bucket=bucket: r2_upload.remote_versions(client, bucket, base)}
+        if args.poster_only:
+            try:
+                add_poster_to_published(input_path, video_args, client, settings_by_kind[kind], kind)
+            except (RuntimeError, ValueError) as err:
+                print(f"\nFAILED {input_path}: {err}")
+                failures.append(input_path)
+            continue
         try:
-            version_dir, slug, version = build_hls(input_path, args, remote_ctx)
+            version_dir, slug, version = build_hls(input_path, video_args, remote_ctx)
             if args.upload:
-                r2_upload.upload_version(client, settings, version_dir, args.remote_path, version,
-                                         dry_run=args.dry_run, skip_validate=True)  # build_hls just validated
+                long_video = kind == "long"
+                if long_video and not args.skip_remote_check:
+                    print("   (long video: the public domain is token-protected, so the post-upload fetch is skipped; "
+                          "the upload is verified through the S3 API)")
+                r2_upload.upload_version(client, settings_by_kind[kind], version_dir, args.remote_path, version,
+                                         dry_run=args.dry_run, skip_validate=True,  # build_hls just validated
+                                         skip_remote_check=args.skip_remote_check or long_video, kind=kind)
         except (RuntimeError, ValueError) as err:
             print(f"\nFAILED {input_path}: {err}")
             failures.append(input_path)

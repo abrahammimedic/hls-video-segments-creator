@@ -1,6 +1,6 @@
 # HLS Video Segments Creator
 
-A command-line toolkit that turns a video file into **adaptive HLS streaming segments** (360p / 720p / 1080p, 6-second fMP4 chunks), validates them, and publishes them to **Cloudflare R2** so a mobile or web player can switch quality automatically as the viewer's bandwidth changes.
+A command-line toolkit that turns a video file into **adaptive HLS streaming segments** (360p / 720p / 1080p, fMP4 chunks: 2 seconds for short videos, 6 seconds for long ones), validates them, and publishes them to **Cloudflare R2** so a mobile or web player can switch quality automatically as the viewer's bandwidth changes.
 
 It was built for serving exercise videos to a Flutter app, but nothing in it is app-specific: any player that understands HLS (ExoPlayer, AVPlayer, hls.js, Safari) can play the output.
 
@@ -52,7 +52,7 @@ Behaviours worth knowing before you start:
 
 - **Aspect ratio and orientation are always kept.** A portrait video stays portrait (360x640, 720x1280, 1080x1920). Nothing is ever stretched.
 - **Never upscaled.** A 720p source produces 360p + 720p only. A source smaller than 360p produces one native-resolution rendition.
-- **Quality switches are seamless.** Every rendition uses the same frame rate and a fixed 2-second keyframe interval, so all 6-second segment boundaries line up across qualities.
+- **Quality switches are seamless.** Every rendition uses the same frame rate and a fixed 2-second keyframe interval, so all segment boundaries line up across qualities.
 - **Versions are immutable.** Each run creates the next `vN`. A published version is never overwritten, so viewers mid-playback and CDN caches never see a mix of old and new files.
 - **Resumable.** If an encode or upload is interrupted, re-run the same command and only the unfinished work is redone.
 - **Silent videos and variable-frame-rate phone/screen recordings work** (the latter are converted to constant frame rate).
@@ -119,6 +119,8 @@ R2_ACCESS_KEY_ID=your_access_key_id
 R2_SECRET_ACCESS_KEY=your_secret_access_key
 R2_BUCKET=your-bucket-name
 R2_PUBLIC_BASE_URL=https://video.example.com
+R2_MOMENTS_BUCKET=your-moments-bucket-name
+R2_MOMENTS_PUBLIC_BASE_URL=https://moments.example.com
 EOF
 chmod 600 ~/.config/video-tool/r2.env
 ```
@@ -135,6 +137,7 @@ set -a; . ~/.config/video-tool/r2.env; set +a
 | `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` | Shown when you create the API token |
 | `R2_BUCKET` | Your bucket's name |
 | `R2_PUBLIC_BASE_URL` | The custom domain from step 1. Used for the post-upload check and the printed player URL |
+| `R2_MOMENTS_BUCKET`, `R2_MOMENTS_PUBLIC_BASE_URL` | The same two things for the **short-video (Moments)** bucket. Only needed when you upload short videos. A short video never falls back to `R2_BUCKET`: without these the upload stops before encoding |
 
 ### 4. Install the upload dependency
 
@@ -203,10 +206,44 @@ python3 make_hls.py INPUT [INPUT ...] [options]
 | `--version N` | next unused number | Explicit version. An unfinished local version is resumed |
 | `--only 360p,720p` | all that the source supports | Build only some renditions |
 | `--preset` | `slow` | x264 preset: `ultrafast` ... `veryslow`. Slower is smaller/better |
+| `--kind short\|long` | asks per video | **short** = Moments reel: 2 s segments, uploaded to the Moments bucket, public check after upload. **long** = exercise video: 6 s segments, uploaded to the token-protected bucket, public check skipped automatically. Without it the tool asks for each video, before any encoding starts, and refuses to guess when there is no terminal |
+| `--segment-seconds N` | `2` for short, `6` for long | Override the segment length; a multiple of 2. Shorter starts and seeks faster; longer means fewer files (and fewer CDN/Worker requests) |
 | `--force` | off | Re-encode even if finished renditions look complete |
 | `--upload` | off | Upload after a successful validation (needs credentials and `--remote-path`) |
 | `--remote-path` | none | With `--upload`: bucket folder, e.g. `courses/week_1/lesson` |
 | `--dry-run` | off | With `--upload`: show what would be uploaded without touching R2 |
+| `--skip-remote-check` | off | With `--upload`: skip the post-upload fetch through the public domain. Long videos skip it by themselves; this is only needed to skip it for a short one |
+
+### Posters (thumbnails)
+
+Every video gets a **poster** automatically: `poster.jpg` is made from the video while it is encoded and published in the same folder as `master.m3u8` (`mi_reels/<name>/v1/poster.jpg`), in the same upload, with the same cache headers. Nothing is uploaded by hand, and the poster can never be out of step with the video.
+
+- **Which frame:** the tool looks at a few short windows (just after the start, a quarter of the way in, halfway), lets ffmpeg choose the most representative frame of each, and takes the first one that is not nearly black or white. A video that opens on a black or white card gets a better frame. If every candidate is extreme it uses the least extreme one and tells you.
+- **Size:** 540 pixels on the short side (540x960 for a portrait reel, 960x540 for a landscape video), never upscaled, a JPEG of about 40-90 KB with no metadata. It is a JPEG because most ffmpeg builds have no WebP encoder.
+- **`--poster-at SECONDS`:** use the frame at that time instead (a timestamp, not an upload). **`--no-poster`:** skip it.
+- **`--poster-only`:** for a video that was published before posters existed. No encoding: it makes the poster from the source file and adds it to the published version, and never touches the video files. Needs `--upload`, `--remote-path` and `--version`; refuses a version that is not published and refuses to replace an existing poster unless `--force` (posters are cached as immutable, so a replaced one can take a long time to show).
+
+```bash
+python3 make_hls.py reel.mp4 --kind short --poster-only --upload --remote-path mi_reels/my_reel --version 1
+python3 make_hls.py reel.mp4 --kind short --poster-at 12.5 --upload --remote-path mi_reels/my_reel
+```
+
+### Short or long?
+
+| | Short | Long |
+|---|---|---|
+| For | Moments reels (also on Instagram, so public) | Exercise and other videos |
+| Segments | 2 seconds | 6 seconds |
+| Bucket | `R2_MOMENTS_BUCKET` (own public domain, no Worker) | `R2_BUCKET` (token-protected through the Worker) |
+| After upload | fetched through the public domain and checked | S3 listing only (the token gate refuses plain requests) |
+
+Why different segments: short pieces start faster but mean about three times as many requests, and every request to the token-protected domain runs the Cloudflare Worker (billed per request). Short videos go to the public domain, which has no Worker, so the extra requests cost nothing; long videos stay on 6 s.
+
+```bash
+python3 make_hls.py reel.mp4 --kind short --upload --remote-path mi_reels/my_reel
+python3 make_hls.py lesson.mp4 --kind long --upload --remote-path exercises/trimester_2/lesson
+python3 make_hls.py clip.mp4          # asks: short or long?
+```
 
 ### `r2_upload.py`: upload a built version
 
@@ -221,6 +258,8 @@ python3 r2_upload.py VERSION_DIR --path BUCKET/FOLDER [options]
 | `--dry-run` | Show the destination and files; upload nothing |
 | `--resume` | Finish a partially uploaded version (no `master.m3u8` in R2 yet) |
 | `--skip-validate` | Skip the local validation before uploading |
+| `--kind short\|long` | Which bucket to publish into (default `long`): short = `R2_MOMENTS_BUCKET`, long = `R2_BUCKET`. A long upload skips the public check by itself |
+| `--skip-remote-check` | Skip the post-upload fetch through the public domain and the CDN check. Use when the domain requires a token and answers plain requests with 403 |
 
 It refuses to upload a version whose `master.m3u8` already exists in the bucket, and it checks object counts and sizes after uploading.
 
@@ -266,7 +305,7 @@ open bitrate_trial/index.html
 
 Audio is AAC-LC, 128 kbps, 48 kHz stereo in every rendition. Change the table to retune, and use `bitrate_trial.py` first to judge the effect by eye.
 
-**Encoding.** Each rendition is encoded with two-pass VBR H.264 (Main profile) capped at 1.5x the target bitrate, then cut into 6-second fragmented-MP4 segments (CMAF). The frame rate is forced constant, and the keyframe interval is exactly 2 seconds so every segment starts on a keyframe.
+**Encoding.** Each rendition is encoded with two-pass VBR H.264 (Main profile) capped at 1.5x the target bitrate, then cut into fragmented-MP4 segments (CMAF), **2 seconds long for short videos and 6 seconds for long ones** (`--kind`, or `--segment-seconds` to override). The frame rate is forced constant, and the keyframe interval is exactly 2 seconds so every segment starts on a keyframe. A segment length must therefore be a multiple of 2 (2, 4, 6, ...); anything else is rejected, because a segment that does not start on a keyframe cannot be played on its own.
 
 **The master playlist** is written by this tool, not by ffmpeg, so it is exact: `BANDWIDTH` and `AVERAGE-BANDWIDTH` are computed from the real segment sizes following RFC 8216, `CODECS` is read from the encoded file's own header, and `RESOLUTION` / `FRAME-RATE` come from the output.
 
@@ -297,6 +336,14 @@ curl -sI https://video.example.com/courses/week_1/lesson/v1/master.m3u8 | grep -
 `r2_upload.py` also runs an advisory version of this check after every upload. Cache state is per data centre, so a missing `HIT` proves nothing, but `DYNAMIC` or `BYPASS` on a `.m3u8`/`.m4s` file means the rule is missing.
 
 **4. CORS** is needed only if you also play the video in a browser from a different origin (for example Flutter web).
+
+**5. Token-protected (signed) delivery.** If your domain only serves requests that carry a valid token (for example a Cloudflare Worker that checks a Firebase token), plain requests get `403 Forbidden`, including the checks this tool makes after an upload. Uploading a **long** video (`--kind long`) skips these checks by itself. For anything else, upload with `--skip-remote-check`:
+
+```bash
+python3 r2_upload.py hls_output/lesson/v1 --path courses/week_1/lesson --skip-remote-check
+```
+
+The upload is then verified through the S3 API only (every object present, sizes match local files), and the tool says so instead of claiming the public URL was validated. Nothing else changes: the playlists use relative URLs, so your token scheme must cover the master playlist, the rendition playlists and every segment and init file. Test playback in the real app with a real token. Apple's validator also cannot fetch a protected URL, but you can still run it against the local build, which it serves from a temporary local web server: `python3 validate_hls.py hls_output/lesson/v1 --apple-validate`.
 
 ## Validation
 
@@ -384,6 +431,7 @@ The suite covers the pure logic (ladder selection, frame-rate handling, RFC 8216
 | Apple validator reports only ~20% of segments processed | It hit its runtime cap. `validate_hls.py --apple-validate` already lifts it; if you call the tool directly, pass `--timeout 3600` |
 | Encode takes very long | 1080p two-pass `slow` is thorough. Use `--preset medium` or `fast`, or `--only 360p,720p` |
 | `This ffmpeg build has no libvmaf filter` | Only `bitrate_trial.py` needs it. Install ffmpeg from Homebrew, which includes libvmaf |
+| Every public URL returns `403 Forbidden`, but `r2_upload.py` can still list and upload | The domain is token-protected (or blocked by a Cloudflare security rule), so plain requests are refused. This is expected for signed delivery. Use `--skip-remote-check`. If you did not set up protection, check Cloudflare Security, Events and the account Audit Logs |
 | `.DS_Store` appears in an output folder | Harmless. The upload allowlist never sends it |
 
 ## Legacy single-file tools

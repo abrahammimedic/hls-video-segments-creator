@@ -4,6 +4,7 @@ import os
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from fractions import Fraction
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -40,6 +41,16 @@ class SegmentBitRates(unittest.TestCase):
         # 2 s + 2 s = 4 s is within 3-9 s, 2 s alone is not.
         peak, _ = common.segment_bit_rates([100, 400], [2.0, 2.0], 6)
         self.assertAlmostEqual(peak, 8 * 500 / 4)
+
+    def test_two_second_segments_and_short_tail(self):
+        # Target 2 s -> qualifying windows are 1-3 s, so a 1 s tail qualifies on its own (1.0 >= 0.5 x 2).
+        peak, average = common.segment_bit_rates([250_000, 250_000, 200_000], [2.0, 2.0, 1.0], 2)
+        self.assertAlmostEqual(peak, 8 * 200_000 / 1.0)
+        self.assertAlmostEqual(average, 8 * 700_000 / 5.0)
+        # ...but a 0.5 s tail does not (below 1 s) and is grouped with its neighbour: [2.0, 0.5] = 2.5 s window.
+        # A naive "largest single segment" rule would report 100000 B / 0.5 s = 1.6 Mbps; RFC 8216 gives 640 kbps.
+        peak, _ = common.segment_bit_rates([100_000, 100_000, 100_000], [2.0, 2.0, 0.5], 2)
+        self.assertAlmostEqual(peak, 8 * 200_000 / 2.5)
 
     def test_rejects_bad_input(self):
         with self.assertRaises(ValueError):
@@ -169,6 +180,97 @@ class Versioning(unittest.TestCase):
     def test_slugify(self):
         self.assertEqual(make_hls.slugify("Trimester 2 yoga_video (final).mp4"), "trimester-2-yoga-video-final-mp4")
         self.assertEqual(make_hls.slugify("!!!"), "video")
+
+
+class SegmentLength(unittest.TestCase):
+    """Short videos (Moments) are cut in 2 s pieces, long ones (exercise) in 6 s (decision 2026-11-18).
+    A length must stay a multiple of the 2 s keyframe interval."""
+
+    def test_defaults_by_kind(self):
+        self.assertEqual(common.KIND_SEGMENT_SECONDS, {"short": 2, "long": 6})
+        self.assertEqual(common.SEGMENT_SECONDS, 6)   # the fallback when no kind is known
+        self.assertEqual(common.GOP_SECONDS, 2)
+        self.assertEqual(common.segment_seconds_for("short"), 2)
+        self.assertEqual(common.segment_seconds_for("long"), 6)
+        self.assertEqual(common.segment_seconds_for(None), 6)
+
+    def test_an_explicit_length_wins_but_is_checked(self):
+        self.assertEqual(common.segment_seconds_for("short", 4), 4)
+        with self.assertRaises(ValueError):
+            common.segment_seconds_for("short", 3)
+
+    def test_valid_and_invalid_lengths(self):
+        for ok in (2, 4, 6, 10):
+            self.assertEqual(common.check_segment_seconds(ok), ok)
+        for bad in (0, 1, 3, 5, -2, 2.0, None, "2"):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                common.check_segment_seconds(bad)
+
+    def test_ffmpeg_uses_the_requested_length(self):
+        r = make_hls.Rendition("720p", 720, 1280, 1500)
+        default = make_hls.pass2_command("in.mp4", r, Fraction(25), "slow", "log", "/tmp/o", True)
+        self.assertEqual(default[default.index("-hls_time") + 1], "6")
+        two = make_hls.pass2_command("in.mp4", r, Fraction(25), "slow", "log", "/tmp/o", True, segment_seconds=2)
+        self.assertEqual(two[two.index("-hls_time") + 1], "2")
+
+    def test_changing_the_length_invalidates_finished_renditions(self):
+        r = make_hls.Rendition("720p", 720, 1280, 1500)
+        with tempfile.NamedTemporaryFile(suffix=".mp4") as source:
+            source.write(b"x"); source.flush()
+            two = make_hls.fingerprint(source.name, r, Fraction(25), "slow", True, 2)
+            six = make_hls.fingerprint(source.name, r, Fraction(25), "slow", True, 6)
+            self.assertNotEqual(two, six)
+            self.assertEqual(six, make_hls.fingerprint(source.name, r, Fraction(25), "slow", True))
+
+    def test_cli_rejects_a_length_that_misses_the_keyframes(self):
+        with unittest.mock.patch.object(sys, "argv", ["make_hls.py", "v.mp4", "--segment-seconds", "3"]):
+            with self.assertRaises(SystemExit):
+                make_hls.parse_args()
+        with unittest.mock.patch.object(sys, "argv", ["make_hls.py", "v.mp4"]):
+            self.assertIsNone(make_hls.parse_args().segment_seconds, "left to the kind")
+        with unittest.mock.patch.object(sys, "argv", ["make_hls.py", "v.mp4", "--segment-seconds", "4"]):
+            self.assertEqual(make_hls.parse_args().segment_seconds, 4)
+
+
+class VideoKind(unittest.TestCase):
+    """Whether a video is short (Moments) or long (exercise) is asked, never guessed."""
+
+    def test_kind_option(self):
+        with unittest.mock.patch.object(sys, "argv", ["make_hls.py", "v.mp4", "--kind", "short"]):
+            self.assertEqual(make_hls.parse_args().kind, "short")
+        with unittest.mock.patch.object(sys, "argv", ["make_hls.py", "v.mp4"]):
+            self.assertIsNone(make_hls.parse_args().kind)
+        with unittest.mock.patch.object(sys, "argv", ["make_hls.py", "v.mp4", "--kind", "medium"]):
+            with self.assertRaises(SystemExit):
+                make_hls.parse_args()
+
+    def test_asks_and_understands_short_and_long(self):
+        for answer, kind in (("s", "short"), ("S", "short"), (" short ", "short"),
+                             ("l", "long"), ("LONG", "long")):
+            self.assertEqual(make_hls.ask_kind("/x/clip.mp4", ask=lambda _: answer, interactive=True), kind)
+
+    def test_asks_again_after_a_bad_answer(self):
+        answers = iter(["", "maybe", "s"])
+        with unittest.mock.patch("builtins.print"):
+            self.assertEqual(make_hls.ask_kind("/x/clip.mp4", ask=lambda _: next(answers), interactive=True), "short")
+
+    def test_the_question_names_the_video(self):
+        seen = []
+        make_hls.ask_kind("/x/Breastfeeding tips.mp4", ask=lambda q: seen.append(q) or "l", interactive=True)
+        self.assertIn("Breastfeeding tips.mp4", seen[0])
+        self.assertIn("SHORT", seen[0])
+        self.assertIn("LONG", seen[0])
+
+    def test_never_guesses_without_a_terminal(self):
+        with self.assertRaises(RuntimeError) as ctx:
+            make_hls.ask_kind("/x/clip.mp4", ask=lambda _: "s", interactive=False)
+        self.assertIn("--kind", str(ctx.exception))
+
+    def test_the_kind_picks_the_segment_length_in_a_build(self):
+        args = unittest.mock.Mock(kind="short", segment_seconds=None)
+        self.assertEqual(common.segment_seconds_for(args.kind, args.segment_seconds), 2)
+        args = unittest.mock.Mock(kind="long", segment_seconds=None)
+        self.assertEqual(common.segment_seconds_for(args.kind, args.segment_seconds), 6)
 
 
 class FfmpegCommands(unittest.TestCase):
@@ -304,6 +406,40 @@ class UploadRules(unittest.TestCase):
                                             "R2_SECRET_ACCESS_KEY": "s", "R2_BUCKET": "b",
                                             "R2_PUBLIC_BASE_URL": "https://cdn.example.com/"})
         self.assertEqual(settings["public_base"], "https://cdn.example.com")
+        self.assertEqual(settings["kind"], "long")
+
+    ENV = {"R2_ACCOUNT_ID": "a", "R2_ACCESS_KEY_ID": "k", "R2_SECRET_ACCESS_KEY": "s",
+           "R2_BUCKET": "exercise-bucket", "R2_PUBLIC_BASE_URL": "https://videos.example.com",
+           "R2_MOMENTS_BUCKET": "moments-bucket", "R2_MOMENTS_PUBLIC_BASE_URL": "https://moments.example.com/"}
+
+    def test_a_short_video_goes_to_the_moments_bucket(self):
+        short = r2_upload.load_settings(self.ENV, kind="short")
+        self.assertEqual((short["bucket"], short["public_base"], short["kind"]),
+                         ("moments-bucket", "https://moments.example.com", "short"))
+        long = r2_upload.load_settings(self.ENV, kind="long")
+        self.assertEqual((long["bucket"], long["public_base"]), ("exercise-bucket", "https://videos.example.com"))
+
+    def test_each_kind_needs_only_its_own_bucket(self):
+        only_exercise = {k: v for k, v in self.ENV.items() if "MOMENTS" not in k}
+        self.assertEqual(r2_upload.load_settings(only_exercise, kind="long")["bucket"], "exercise-bucket")
+        with self.assertRaises(RuntimeError) as ctx:
+            r2_upload.load_settings(only_exercise, kind="short")
+        self.assertIn("R2_MOMENTS_BUCKET", str(ctx.exception))
+        only_moments = {k: v for k, v in self.ENV.items() if k not in ("R2_BUCKET", "R2_PUBLIC_BASE_URL")}
+        self.assertEqual(r2_upload.load_settings(only_moments, kind="short")["bucket"], "moments-bucket")
+        with self.assertRaises(RuntimeError) as ctx:
+            r2_upload.load_settings(only_moments, kind="long")
+        self.assertIn("R2_BUCKET", str(ctx.exception))
+
+    def test_a_short_video_never_falls_back_to_the_exercise_bucket(self):
+        """A missing Moments bucket must stop the upload, not quietly publish a reel into the other bucket."""
+        env = {k: v for k, v in self.ENV.items() if k != "R2_MOMENTS_BUCKET"}
+        with self.assertRaises(RuntimeError):
+            r2_upload.load_settings(env, kind="short")
+
+    def test_unknown_kind_is_refused(self):
+        with self.assertRaises(ValueError):
+            r2_upload.load_settings(self.ENV, kind="medium")
 
 
 if __name__ == "__main__":

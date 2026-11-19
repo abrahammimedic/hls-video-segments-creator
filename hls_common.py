@@ -9,8 +9,13 @@ import re
 import subprocess
 from fractions import Fraction
 
-SEGMENT_SECONDS = 6
-GOP_SECONDS = 2
+# What kind of video this is decides how it is cut and where it goes (decision 2026-11-18):
+#   short = Moments reels: 2 s segments (fast start), public bucket, no token
+#   long  = exercise and other videos: 6 s segments (fewer requests), token-protected bucket
+KINDS = ("short", "long")
+KIND_SEGMENT_SECONDS = {"short": 2, "long": 6}
+SEGMENT_SECONDS = KIND_SEGMENT_SECONDS["long"]   # fallback when no kind is known
+GOP_SECONDS = 2              # keyframe interval; every segment must start on a keyframe
 EPS = 1e-6
 
 
@@ -20,6 +25,21 @@ def human_size(num_bytes):
             return f"{num_bytes:.1f} {unit}"
         num_bytes /= 1024
     return f"{num_bytes:.1f} TB"
+
+
+def segment_seconds_for(kind, override=None):
+    """The segment length for a video of this kind; an explicit override (--segment-seconds) wins."""
+    if override is not None:
+        return check_segment_seconds(override)
+    return KIND_SEGMENT_SECONDS.get(kind, SEGMENT_SECONDS)
+
+
+def check_segment_seconds(value):
+    """A segment must start on a keyframe, so its length must be a whole multiple of the GOP."""
+    if not isinstance(value, int) or value < GOP_SECONDS or value % GOP_SECONDS:
+        raise ValueError(f"segment length must be a multiple of {GOP_SECONDS} seconds (got {value!r}); "
+                         f"every segment has to start on a {GOP_SECONDS}-second keyframe")
+    return value
 
 
 def parse_fraction(text):
